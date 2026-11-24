@@ -23,9 +23,10 @@ class Entry:
     index: int
     der: bytes
     is_tbs: bool  # True for precert entries (bare TBSCertificate)
+    ts: int = 0   # log timestamp, ms since epoch
 
 
-def http_get(url: str, timeout: float = 30, retries: int = 6) -> bytes:
+def http_get(url: str, timeout: float = 30, retries: int = 6, fatal=(404,)) -> bytes:
     delay = 1.0
     for attempt in range(retries):
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"})
@@ -36,7 +37,7 @@ def http_get(url: str, timeout: float = 30, retries: int = 6) -> bytes:
                     data = gzip.decompress(data)
                 return data
         except urllib.error.HTTPError as e:
-            if e.code == 404 or attempt == retries - 1:
+            if e.code in fatal or attempt == retries - 1:
                 raise
             ra = e.headers.get("Retry-After") if e.headers else None
             wait = float(ra) if ra and ra.isdigit() else delay
@@ -76,39 +77,39 @@ class Reader:
         return self.o >= len(self.b)
 
 
-def parse_merkle_leaf(leaf: bytes) -> tuple[bytes, bool]:
-    """RFC 6962 MerkleTreeLeaf -> (der, is_tbs)."""
+def parse_merkle_leaf(leaf: bytes) -> tuple[bytes, bool, int]:
+    """RFC 6962 MerkleTreeLeaf -> (der, is_tbs, timestamp_ms)."""
     r = Reader(leaf)
     r.u(1)  # version
     r.u(1)  # leaf type
-    r.u(8)  # timestamp
+    ts = r.u(8)
     et = r.u(2)
     if et == X509_ENTRY:
-        return r.vec(3), False
+        return r.vec(3), False, ts
     if et == PRECERT_ENTRY:
         r.raw(32)  # issuer_key_hash
-        return r.vec(3), True
+        return r.vec(3), True, ts
     raise ValueError(f"unknown entry type {et}")
 
 
 def parse_tile_leaves(data: bytes):
-    """static-ct-api data tile -> iterator of (der, is_tbs)."""
+    """static-ct-api data tile -> iterator of (der, is_tbs, timestamp_ms)."""
     r = Reader(data)
     while not r.done():
-        r.u(8)  # timestamp
+        ts = r.u(8)
         et = r.u(2)
         if et == X509_ENTRY:
             der = r.vec(3)
             r.vec(2)  # extensions
             r.vec(2)  # chain fingerprints
-            yield der, False
+            yield der, False, ts
         elif et == PRECERT_ENTRY:
             r.raw(32)
             der = r.vec(3)
             r.vec(2)  # extensions
             r.vec(3)  # pre_certificate
             r.vec(2)  # chain fingerprints
-            yield der, True
+            yield der, True, ts
         else:
             raise ValueError(f"unknown entry type {et}")
 
@@ -141,8 +142,8 @@ class RFC6962Log:
                 break
             for e in got:
                 try:
-                    der, tbs = parse_merkle_leaf(base64.b64decode(e["leaf_input"]))
-                    out.append(Entry(pos, der, tbs))
+                    der, tbs, ts = parse_merkle_leaf(base64.b64decode(e["leaf_input"]))
+                    out.append(Entry(pos, der, tbs, ts))
                 except Exception:
                     pass
                 pos += 1
@@ -181,15 +182,17 @@ class StaticLog:
             width = min(self.TILE, end - base)
             # A partial tile only exists at the tree's right edge; prefer the full tile.
             try:
-                data = http_get(f"{self.url}tile/data/{tile_path(t)}")
+                # object stores answer 403 or 404 for a tile that is not full yet
+                data = http_get(f"{self.url}tile/data/{tile_path(t)}",
+                                fatal=(403, 404) if width < self.TILE else (404,))
             except urllib.error.HTTPError as e:
-                if e.code != 404 or width == self.TILE:
+                if e.code not in (403, 404) or width == self.TILE:
                     raise
                 data = http_get(f"{self.url}tile/data/{tile_path(t)}.p/{width}")
-            for i, (der, tbs) in enumerate(parse_tile_leaves(data)):
+            for i, (der, tbs, ts) in enumerate(parse_tile_leaves(data)):
                 idx = base + i
                 if start <= idx < end:
-                    out.append(Entry(idx, der, tbs))
+                    out.append(Entry(idx, der, tbs, ts))
             t += 1
         return out
 

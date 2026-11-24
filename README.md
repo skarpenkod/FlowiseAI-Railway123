@@ -1,96 +1,106 @@
-# cthunt — китайские домены из логов Certificate Transparency
+# Домены китайского интернета: CT, Common Crawl, CrUX
 
-Почти каждый сайт на HTTPS попадает в публичные логи Certificate Transparency (CT): с 2018 года браузеры не принимают сертификат, если его нет в логе. `cthunt` читает эти логи напрямую, достаёт из каждого сертификата имена хостов (CN + SAN) и оставляет китайские:
+Три независимых скрипта собирают домены китайского интернета из бесплатных источников. Каждый пишет свой Parquet в общем формате:
 
-| Причина (`reason`) | Что ловит |
-|---|---|
-| `tld`   | `.cn` со всеми зонами второго уровня (`.com.cn`, `.gov.cn`, `.bj.cn` …), `.中国`, `.中國` |
-| `brand` | домены китайских брендов и все их поддомены: `taobao.com`, `qq.com`, `huaweicloud.com` … ([`cthunt/brands.txt`](cthunt/brands.txt)) |
-| `kw`    | ключевое слово в регистрируемом домене: `huawei`, `aliyun`, `bytedance` … |
-| `org`   | любые имена из OV/EV-сертификата, выданного организации с `C=CN` (ловит китайские компании на `.com`) |
+| Скрипт | Источник | Файл |
+|---|---|---|
+| `ct_collect.py`   | логи Certificate Transparency (RFC 6962 и tiled static-ct-api) | `ct_domains.parquet` |
+| `cc_collect.py`   | индекс URL Common Crawl (Parquet, только нужные колонки)        | `cc_domains.parquet` |
+| `crux_collect.py` | Chrome UX Report в BigQuery, `chrome-ux-report.country_cn`      | `crux_domains.parquet` |
 
-Бесплатно, без API-ключей и без зависимостей: нужен только Python 3.10+.
+`validate.py` проверяет файлы на соответствие схеме и ищет в них контрольный список из 20 доменов.
 
-## Быстрый старт
-
-```bash
-git clone <this repo> && cd <repo>
-
-# какие логи будут читаться (берётся актуальный список Google)
-python -m cthunt logs --sizes
-
-# последний 1 млн записей каждого активного лога
-python -m cthunt run
-
-# работать постоянно и забирать новые сертификаты
-python -m cthunt run --follow
-
-# сколько собрано и докуда дочитан каждый лог
-python -m cthunt stats
-
-# выгрузка
-python -m cthunt export -o hosts.txt            # все хосты с поддоменами
-python -m cthunt export --apex -o apex.txt      # только регистрируемые домены
-python -m cthunt export --reason tld -o cn.txt  # только .cn
-```
-
-`--db` указывается до команды: `python -m cthunt --db china.db run`. По умолчанию это `cthunt.db`.
-
-## Как набрать миллионы
-
-Логи огромные: в одном полугодовом шарде Google Argon или Let's Encrypt лежат сотни миллионов записей. Есть три режима:
-
-1. **Свежий срез**, по умолчанию: `--tail 1000000` от головы каждого лога. Быстро даёт сотни тысяч хостов.
-2. **Полный проход** по текущим шардам: `run --from-start`. Шард покрывает все сертификаты, которые истекают в его окне, то есть все живые сайты. Это часы или дни, зависит от лимитов логов. Прогресс сохраняется в SQLite, поэтому после Ctrl+C или падения тот же запуск продолжит с места остановки.
-3. **История**: `--all-shards` добавляет прошлые шарды, где лежат сайты, которые уже не продлевали сертификат.
-
-Добор поддоменов через crt.sh, исторический поиск по всем логам:
+## Установка
 
 ```bash
-python -m cthunt crtsh --reason brand --limit 200   # поддомены брендовых доменов из базы
-python -m cthunt crtsh --domains my_apexes.txt
+pip install -r requirements.txt      # Python 3.11+
 ```
 
-crt.sh медленный и иногда отвечает 502/таймаутом. Запросы идут с паузой (`--delay`), ошибки пропускаются.
+DuckDB-расширение `httpfs` не нужно. Скрипты читают удалённый Parquet через HTTP Range: pyarrow скачивает только нужные колонки, DuckDB фильтрует и агрегирует локально.
 
-## Настройка
+## Общий формат
+
+| Поле | Тип | Что это |
+|---|---|---|
+| `domain` | string | eTLD+1 в punycode (tldextract + локальная копия PSL) |
+| `host` | string | полное имя хоста, ключ дедупликации |
+| `source` | string | `ct` / `cc` / `crux` |
+| `reason` | string | `cn_tld` / `china_list` / `lang_zho` / `crux_cn` |
+| `first_seen`, `last_seen` | date | первое и последнее появление в источнике |
+| `hits` | int64 | CT: уникальные сертификаты; CC: страницы; CrUX: месяцы |
+| `extra` | json | CT: `issuers`, `logs`; CC: `crawls`, `zho_pages`; CrUX: `rank`, `chinese`, `origins` |
+
+Нормализация: нижний регистр, без `*.` и точки в конце, IDN переводится в punycode.
+
+Домен считается китайским, если выполнено хотя бы одно условие:
+- зона `.cn` или `.中国` (`xn--fiqs8s`);
+- домен или его родитель есть в [`accelerated-domains.china.conf`](https://github.com/felixonmars/dnsmasq-china-list), список скачивается при каждом запуске;
+- для CC: `content_languages` начинается с `zho`.
+
+Если подходит несколько причин, в `reason` записывается первая по приоритету: `cn_tld`, затем `china_list`, затем `lang_zho`.
+
+Скачанные PSL и china-list кешируются в `.cache/`. Чекпоинты лежат в `work/` (меняется через `--work`). Повторный запуск той же команды продолжает работу с места остановки, без потерь и дублей.
+
+## 1. CT — `ct_collect.py`
 
 ```bash
-# только свои зоны, без брендов
-python -m cthunt run --no-brands --suffix cn --suffix hk
+# сначала замер скорости на одном логе
+python ct_collect.py --logs sycamore2027h1 --tail 2000000
 
-# только определённые логи
-python -m cthunt run --only 'argon|xenon'
-python -m cthunt run --log https://ct.googleapis.com/logs/us1/argon2026h2/
-python -m cthunt run --log static:https://mon.willow.ct.letsencrypt.org/2026h2/
+# все текущие шарды за 13 месяцев (порядка 46 млрд записей, это недели)
+python ct_collect.py --since 13 --workers 16 --out ct_domains.parquet
 
-# скорость: параллельные запросы на лог и число логов одновременно
-python -m cthunt run --workers 8 --parallel-logs 12
+# ограничить время: через 6 часов сохранить чекпоинт и выйти; потом та же команда продолжит
+python ct_collect.py --hours 6
 ```
 
-Бренды и ключевые слова лежат в [`cthunt/brands.txt`](cthunt/brands.txt), свой список задаётся через `--brands file.txt`. Короткие ключевые слова (`qq`, `mi`, `jd`) задавайте доменами, а не через `kw:`, иначе они совпадут с половиной интернета.
+- Список логов берётся из `log_list.json` (gstatic). Используются шарды в состоянии usable/qualified/readonly, которые ещё не истекли.
+- Стартовый индекс в каждом логе находится бинарным поиском по времени записи (`--since`).
+- Каждый лог обрабатывается в отдельном процессе (`--procs`, разбор упирается в CPU), внутри него работают `--workers` HTTP-запросов. На 429/5xx скрипт делает паузу с учётом `Retry-After`.
+- Каждые `--chunk` записей в `work/ct/<лог>/` записывается part-файл, после этого сдвигается чекпоинт `state.json`.
+- `hits` считает уникальные сертификаты (хеш издателя и серийного номера). Пара precert/cert и один сертификат в нескольких логах дают одно попадание.
+- Остальные параметры: `--logs` (`all` или части имён/URL через запятую), `--tail N` (только свежие N записей), `--max-entries`, `--aggregate-only`.
 
-## Как это устроено
+**Скорость.** Tiled-логи (Let's Encrypt, Google ParcelYard/PlumbersArms) отдают около 10 тыс. записей/с на процесс, классические RFC 6962 логи Google — около 1 тыс./с. Один шард на 1,4 млрд записей — это около 1,5 суток на одном процессе. Сертификат лежит минимум в двух логах разных операторов, так что заметную часть всех имён дают несколько крупных логов.
 
-- Поддерживаются оба типа логов: классический **RFC 6962** (`get-sth` / `get-entries`) и новый **static-ct-api** (tiled, Sunlight), на который переходят Let's Encrypt и другие операторы.
-- Читаются и обычные сертификаты, и precert-записи.
-- DER разбирается вручную (`cthunt/der.py`): около 100 тыс. сертификатов в секунду на одном ядре. Узкое место — сеть и лимиты логов, не CPU.
-- Результаты лежат в SQLite (`hosts`: name, apex, reason, source, first_seen) без дублей. В таблице `progress` хранится позиция в каждом логе.
-- При 429/5xx запрос повторяется с экспоненциальной паузой и учётом `Retry-After`.
-
-## Docker / Railway
+## 2. Common Crawl — `cc_collect.py`
 
 ```bash
-docker build -t cthunt .
-docker run -v $PWD/data:/data cthunt                   # run --follow
-docker run -v $PWD/data:/data cthunt export -o /data/hosts.txt
+python cc_collect.py                               # 6 последних краулов
+python cc_collect.py --crawls CC-MAIN-2026-43 --threads 12
 ```
 
-## Тесты
+- Пути к Parquet-файлам индекса берутся из `crawl-data/<CRAWL>/cc-index-table.paths.gz` (подмножество `subset=warc`, 300 файлов на краул).
+- Читаются только колонки `url_host_name`, `url_host_registered_domain`, `url_host_tld`, `content_languages`, `fetch_status`. Это около 2 МБ на файл и около 600 МБ на краул вместо 160 ГБ.
+- Фильтр: `fetch_status = 200` и выполнено одно из условий: `.cn`/`.中国`, china-list, язык `zho…`. Результат группируется по host.
+- `first_seen`/`last_seen` — дата краула (понедельник ISO-недели из `CC-MAIN-YYYY-WW`).
+- Чекпоинт: `work/cc/<crawl>/done.txt` и part-файл на каждый файл индекса.
+
+## 3. CrUX — `crux_collect.py`
 
 ```bash
-pip install cryptography
-python -m unittest tests.test_cthunt -v
+gcloud auth application-default login       # или GOOGLE_APPLICATION_CREDENTIALS=key.json
+python crux_collect.py --project MY_GCP_PROJECT --dry-run   # только объём сканирования
+python crux_collect.py --project MY_GCP_PROJECT --months 12
 ```
 
-Тесты поднимают фейковый RFC 6962-лог и фейковый tiled-лог с синтетическими сертификатами и прогоняют полный цикл.
+- Перед запуском скрипт сверяет схему: какие месяцы есть в `INFORMATION_SCHEMA.TABLES` и есть ли колонка `experimental.popularity.rank`.
+- Читаются только `origin` и `rank`. Перед запросом выполняется dry run, объём печатается. Если он больше `--max-bytes` (по умолчанию 1 ТБ), скрипт останавливается.
+- Сохраняются все origin. В `reason` пишется `cn_tld`/`china_list` для китайских доменов и `crux_cn` для остальных, флаг лежит в `extra.chinese`. В `extra.rank` — лучший ранг, `hits` = число месяцев.
+- Чекпоинт: `work/crux/YYYYMM.parquet` на каждый месяц.
+
+## Проверка
+
+```bash
+python validate.py ct_domains.parquet cc_domains.parquet crux_domains.parquet
+```
+
+Проверяются колонки и типы, отсутствие дублей host и NULL, допустимые `source`/`reason`, нормализация, что host лежит под domain, `first_seen <= last_seen`, `hits >= 1` и валидность JSON. Дополнительно печатаются число доменов в `.cn` и совпадения с контрольным списком (baidu.com, qq.com, sina.com.cn и т.д.).
+
+## Дальше (вне ТЗ)
+
+Слияние трёх файлов по `domain`, резолв DNS с фильтром по китайским IP, проверка HTTP, обогащение по ICP.
+
+---
+
+В `cthunt/` лежит первая версия CT-сборщика на SQLite. Из него `ct_collect.py` использует разбор DER (`cthunt/der.py`) и клиенты логов (`cthunt/ctlog.py`).

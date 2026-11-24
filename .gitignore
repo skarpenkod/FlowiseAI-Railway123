@@ -2,5 +2,6 @@
 *.db-wal
 *.db-shm
 __pycache__/
-*.txt
-!cthunt/brands.txt
+.cache/
+work/
+*.tmp

@@ -49,6 +49,13 @@ def _decode_str(tag: int, raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
+def _parse_issuer(buf: bytes, s: int, e: int, out: dict) -> None:
+    out["issuer_raw"] = buf[s:e]
+    tmp = {"cn": [], "country": None, "org": None}
+    _parse_name(buf, s, e, tmp)
+    out["issuer"] = tmp["org"] or (tmp["cn"][0] if tmp["cn"] else None)
+
+
 def _parse_name(buf: bytes, s: int, e: int, out: dict) -> None:
     # Name ::= SEQUENCE OF SET OF AttributeTypeAndValue
     for _, rs, re_ in children(buf, s, e):
@@ -80,11 +87,12 @@ def _parse_extensions(buf: bytes, s: int, e: int, out: dict) -> None:
 
 
 def parse_names(der: bytes, is_tbs: bool = False) -> dict:
-    """Extract subject CN/C/O and SAN dNSNames.
+    """Extract subject CN/C/O, SAN dNSNames, serial number and issuer (O, else CN).
 
     ``der`` is a full Certificate, or a bare TBSCertificate when ``is_tbs`` (CT precert entries).
     """
-    out = {"cn": [], "san": [], "country": None, "org": None}
+    out = {"cn": [], "san": [], "country": None, "org": None,
+           "serial": b"", "issuer": None, "issuer_raw": b""}
     _, s, e = tlv(der, 0)
     if not is_tbs:
         _, s, e = tlv(der, s)               # tbsCertificate
@@ -93,7 +101,11 @@ def parse_names(der: bytes, is_tbs: bool = False) -> dict:
         if idx == 0 and tag == 0xA0:        # optional explicit version
             continue
         # 0 serial, 1 signature, 2 issuer, 3 validity, 4 subject, 5 spki, then optional [1] [2] [3]
-        if idx == 4:
+        if idx == 0:
+            out["serial"] = der[cs:ce]
+        elif idx == 2:
+            _parse_issuer(der, cs, ce, out)
+        elif idx == 4:
             _parse_name(der, cs, ce, out)
         elif tag == 0xA3:
             _parse_extensions(der, cs, ce, out)
