@@ -44,11 +44,12 @@ def iso(s: str) -> dt.datetime:
     return dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def select_logs(log_list: dict, names: str, since_months: int) -> list[dict]:
+def select_logs(log_list: dict, names: str, since_months: int, exclude: str | None = None) -> list[dict]:
     """Current shards: they hold every certificate that is still valid or was logged in the window."""
     now = dt.datetime.now(dt.timezone.utc)
     horizon = now + dt.timedelta(days=31 * since_months)
     wanted = [w.strip().lower() for w in names.split(",")] if names and names != "all" else None
+    skip = [w.strip().lower() for w in exclude.split(",")] if exclude else []
     out = []
     for op in log_list["operators"]:
         for kind, url_key in (("logs", "url"), ("tiled_logs", "monitoring_url")):
@@ -61,7 +62,10 @@ def select_logs(log_list: dict, names: str, since_months: int) -> list[dict]:
                     continue
                 desc = f'{op["name"]} {lg["description"]}'
                 url = lg[url_key]
-                if wanted and not any(w in desc.lower().replace(" ", "") or w in url.lower() for w in wanted):
+                key = desc.lower().replace(" ", "") + " " + url.lower()
+                if wanted and not any(w in key for w in wanted):
+                    continue
+                if any(w in key for w in skip):
                     continue
                 out.append({"name": desc, "url": url, "kind": "static" if kind == "tiled_logs" else "rfc6962"})
     return out
@@ -243,6 +247,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--logs", default="all",
                     help="'all' or comma-separated parts of log names/URLs, e.g. 'sycamore2027h1,argon'")
+    ap.add_argument("--exclude", help="comma-separated parts of log names/URLs to skip, e.g. 'argon,xenon'")
     ap.add_argument("--since", type=int, default=13, help="months back (default 13 = every valid certificate)")
     ap.add_argument("--workers", type=int, default=16, help="parallel HTTP requests per log")
     ap.add_argument("--procs", type=int, default=mp.cpu_count(), help="logs processed at once (one process each)")
@@ -268,7 +273,7 @@ def main(argv=None):
             download(a.log_list, path)
         else:
             path = Path(a.log_list)
-        logs = select_logs(json.loads(path.read_text()), a.logs, a.since)
+        logs = select_logs(json.loads(path.read_text()), a.logs, a.since, a.exclude)
         if not logs:
             sys.exit("no logs matched --logs")
         log.info("%d logs: %s", len(logs), ", ".join(l["name"] for l in logs))

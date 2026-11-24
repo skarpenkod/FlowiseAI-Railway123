@@ -52,6 +52,8 @@ python ct_collect.py --since 13 --workers 16 --out ct_domains.parquet
 
 # ограничить время: через 6 часов сохранить чекпоинт и выйти; потом та же команда продолжит
 python ct_collect.py --hours 6
+
+# полный прогон на VPS: docs/CT_FULL_RUN.md
 ```
 
 - Список логов берётся из `log_list.json` (gstatic). Используются шарды в состоянии usable/qualified/readonly, которые ещё не истекли.
